@@ -287,7 +287,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "/h":
 				fallthrough
 			case "/help":
-				m.hoveredMessageIndex++
 				m.textInput.Reset()
 				m.mu.Lock()
 				m.messages = append(m.messages, Message{
@@ -297,6 +296,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					text:      helpText,
 				})
 				m.mu.Unlock()
+				m.hoveredMessageIndex++
 				return m, nil
 			// enter quits application
 			case "/q":
@@ -306,15 +306,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			// enter sends request for our external address
 			case "/getaddr":
+				m.mu.Lock()
+				m.messages = append(m.messages, Message{
+					time:      time.Now(),
+					ip:        bubblePinkAccentStyle.Render("(You)") + " localhost",
+					port:      m.localPort,
+					text:      input,
+					delivered: false,
+				})
+				m.mu.Unlock()
+				m.hoveredMessageIndex++
 				return m, requestAddress(m.conn, m.whoamiServerAddrs)
 			// enter appends message to local chat and sends that message to peer
 			default:
-				m.hoveredMessageIndex++
 				var delivered bool
 				if m.lastPingTime != nil {
 					delivered = time.Since(*m.lastPingTime) <= punchInterval
 				}
-
 				m.mu.Lock()
 				m.messages = append(m.messages, Message{
 					time:      time.Now(),
@@ -324,7 +332,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					delivered: delivered,
 				})
 				m.mu.Unlock()
-
+				m.hoveredMessageIndex++
 				return m, sendMessage(m.conn, m.remoteAddr, input)
 			}
 
