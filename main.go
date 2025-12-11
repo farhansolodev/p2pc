@@ -385,14 +385,14 @@ func (m *Model) View() string {
 	var output string
 
 	// debug
-	output += fmt.Sprintf("%+v\n", m.whoamiServerAddrs)
+	// output += fmt.Sprintf("%+v\n", m.whoamiServerAddrs)
 	// output += "currentMessageIndex: " + strconv.Itoa(m.hoveredMessageIndex)
 	// output += "\nhoveredMessage: " + m.hoveredMessage
 	// output += "\ncopied: " + strconv.FormatBool(m.copied)
 	// output += "\ntextInput.Value(): " + m.textInput.Value()
 	// output += fmt.Sprintf("\nrows:%d cols:%d", m.rows, m.cols)
 	// output += fmt.Sprintf("\nlast ping: %v", m.lastPingTime)
-	output += "\n\n"
+	// output += "\n\n"
 
 	for _, message := range m.messages {
 		output += fmt.Sprintf("%s:%d %s%s%s",
