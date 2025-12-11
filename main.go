@@ -5,38 +5,17 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wrap"
 	// "golang.org/x/sys/windows"
 )
-
-var punchInterval = 500 * time.Millisecond
-
-func punchHoles(conn *net.UDPConn, remoteAddr *net.UDPAddr, done chan struct{}) {
-	ticker := time.NewTicker(punchInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			_, err := conn.WriteToUDP([]byte("ping"), remoteAddr)
-			if err != nil {
-				// Silently continue on ping errors
-				continue
-			}
-		}
-	}
-}
 
 // func pollConsoleSize(p *tea.Program) {
 // 	var lastCols, lastRows int
@@ -78,6 +57,11 @@ type (
 	Ping     Message
 )
 
+// type Debug struct{ 
+// 	label	string
+// 	value	any
+// }
+
 type Model struct {
 	mu   sync.Mutex    // Protects concurrent access to messages
 	done chan struct{} // Signals shutdown to background goroutines
@@ -87,22 +71,21 @@ type Model struct {
 	lastPingTime *time.Time
 
 	conn          *net.UDPConn
-	remoteAddr    *net.UDPAddr
-	localPort     int
-	discoveryAddr *net.UDPAddr
+	remoteAddr       *net.UDPAddr
+	localPort        int
 
-	peerMessages []Message
-	userMessages []Message
-	allMessages  []Message
+	whoamiServerAddrs []*net.UDPAddr
 
-	hoveredMessageIndex int
-	hoveredMessage      string
-	copied              bool
-
+	messages  []Message
+	
+	textInputBuffer string
 	textInput textinput.Model
+	hoveredMessageIndex int
 
 	// rows int
 	// cols int
+
+	// debug []Debug
 }
 
 // type ResizeMsg struct {
@@ -110,11 +93,57 @@ type Model struct {
 // 	cols int
 // }
 
+var helpText = `Commands:
+	/addwhoami <addr> [...<addr>] Add whoami server addresses
+	/getaddr		Get public ip:port pair
+	/quit, /q		Quit application
+	/help, /h, 		Show this help
+	<arrow-up>		Move up in chat history 
+	<arrow-down>	Move down in chat history` 
+
 var (
 	bubblePinkAccentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-	buttonStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("#000000")).Background(lipgloss.Color("#00ff00"))
 	width                 = 80
+	punchInterval         = 500 * time.Millisecond
 )
+
+// addrList satisfies flag.Value interface for repeated flags
+type addrList []string
+func (a *addrList) String() string {
+	return strings.Join(*a, ", ")
+}
+func (a *addrList) Set(value string) error {
+	*a = append(*a, value)
+	return nil
+}
+
+func clamp(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func punchHoles(conn *net.UDPConn, remoteAddr *net.UDPAddr, done chan struct{}) {
+	ticker := time.NewTicker(punchInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			_, err := conn.WriteToUDP([]byte("ping"), remoteAddr)
+			if err != nil {
+				// Silently continue on ping errors
+				continue
+			}
+		}
+	}
+}
 
 // A command to send a message to the remote peer
 func sendMessage(conn *net.UDPConn, remoteAddr *net.UDPAddr, message string) tea.Cmd {
@@ -175,10 +204,27 @@ func waitForPings(sub <-chan Ping) tea.Cmd {
 	}
 }
 
-// A command to request the discovery server for our external address
-func requestAddress(conn *net.UDPConn, discoveryAddr *net.UDPAddr) tea.Cmd {
-	_, _ = conn.WriteToUDP([]byte("whoami"), discoveryAddr)
-	return nil
+// A command to request the whoami server for our external address
+func requestAddress(conn *net.UDPConn, whoamiServerAddrs []*net.UDPAddr) tea.Cmd {
+	return func() tea.Msg {
+		for _, addr := range whoamiServerAddrs {
+			conn.WriteToUDP([]byte("whoami"), addr)
+		}
+		return nil
+	}
+}
+
+// down = +1, up = -1
+func updateInputFromHover(m *Model, direction int) {
+	if len(m.messages) > 0 {
+		m.hoveredMessageIndex = clamp(m.hoveredMessageIndex+direction, 0, len(m.messages))
+	}
+	if m.hoveredMessageIndex < len(m.messages) {
+		m.textInput.SetValue(m.messages[m.hoveredMessageIndex].text)
+	} else {
+		m.textInput.SetValue(m.textInputBuffer)
+	}			
+	m.textInput.SetCursor(len(m.textInput.Value()))
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -194,76 +240,88 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyDown:
-			if len(m.allMessages) > 0 {
-				m.hoveredMessageIndex = clamp(m.hoveredMessageIndex+1, 0, len(m.allMessages))
-				m.copied = false
-			}
-			if m.hoveredMessageIndex < len(m.allMessages) {
-				m.hoveredMessage = m.allMessages[m.hoveredMessageIndex].text
-			} else {
-				m.hoveredMessage = ""
-			}
+			updateInputFromHover(m, 1)
 			return m, nil
 
 		case tea.KeyUp:
-			if len(m.allMessages) > 0 {
-				m.hoveredMessageIndex = clamp(m.hoveredMessageIndex-1, 0, len(m.allMessages))
-				m.copied = false
-			}
-			if m.hoveredMessageIndex < len(m.allMessages) {
-				m.hoveredMessage = m.allMessages[m.hoveredMessageIndex].text
-			} else {
-				m.hoveredMessage = ""
-			}
+			updateInputFromHover(m, -1)
 			return m, nil
 
 		case tea.KeyEnter:
-			// enter only copies to clipboard
-			if m.hoveredMessageIndex < len(m.allMessages) && len(m.allMessages) > 0 {
-				_ = clipboard.WriteAll(m.hoveredMessage)
-				m.copied = true
-				return m, nil
-			}
-
-			// enter does nothing
 			input := m.textInput.Value()
-			if input == "" {
+			m.textInput.Reset()
+
+			// enter adds whoami server(s)
+			if strings.HasPrefix(input, "/addwhoami") {
+				addrs := strings.Fields(input)[1:]
+				for _, s := range addrs {
+					addr, err := net.ResolveUDPAddr("udp", s)
+					if err == nil {
+						addrExists := slices.ContainsFunc(m.whoamiServerAddrs, func(a *net.UDPAddr) bool {
+							return a.IP.Equal(addr.IP) && a.Port == addr.Port
+						})
+						if addrExists {
+							return m, nil
+						}
+						m.whoamiServerAddrs = append(m.whoamiServerAddrs, addr)
+					} else {
+						m.mu.Lock()
+						m.messages = append(m.messages, Message{
+							time:      time.Now(),
+							ip:        bubblePinkAccentStyle.Render("(SYSTEM)") + " localhost",
+							port:      m.localPort,
+							text:      "Error: " + err.Error(),
+						})
+						m.mu.Unlock()
+						m.hoveredMessageIndex++
+					}
+				}
 				return m, nil
-			}
-			// enter quits application
-			if input == "/q" || input == "/quit" {
-				close(m.done)
-				return m, tea.Quit
 			}
 
 			switch input {
-			// enter gets our external address
-			case "/getaddr":
+			// enter does nothing
+			case "":
+				return m, nil
+			// enter prints help text
+			case "/h":
+				fallthrough
+			case "/help":
+				m.hoveredMessageIndex++
 				m.textInput.Reset()
-				return m, requestAddress(m.conn, m.discoveryAddr)
-				// enter sends message
+				m.mu.Lock()
+				m.messages = append(m.messages, Message{
+					time:      time.Now(),
+					ip:        bubblePinkAccentStyle.Render("(SYSTEM)") + " localhost",
+					port:      m.localPort,
+					text:      helpText,
+				})
+				m.mu.Unlock()
+				return m, nil
+			// enter quits application
+			case "/q":
+				fallthrough
+			case "/quit":
+				close(m.done)
+				return m, tea.Quit
+			// enter sends request for our external address
+			case "/getaddr":
+				return m, requestAddress(m.conn, m.whoamiServerAddrs)
+			// enter appends message to local chat and sends that message to peer
 			default:
 				m.hoveredMessageIndex++
-				m.copied = false
-				m.textInput.Reset()
-
 				var delivered bool
 				if m.lastPingTime != nil {
 					delivered = time.Since(*m.lastPingTime) <= punchInterval
 				}
 
 				m.mu.Lock()
-				m.userMessages = append(m.userMessages, Message{
+				m.messages = append(m.messages, Message{
 					time:      time.Now(),
 					ip:        bubblePinkAccentStyle.Render("(You)") + " localhost",
 					port:      m.localPort,
 					text:      input,
 					delivered: delivered,
-				})
-				m.allMessages = append([]Message{}, append(m.peerMessages, m.userMessages...)...)
-				// Sort the combined slice by timestamp
-				sort.Slice(m.allMessages, func(i, j int) bool {
-					return m.allMessages[i].time.Before(m.allMessages[j].time)
 				})
 				m.mu.Unlock()
 
@@ -276,33 +334,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Handle regular typing
 		default:
+			m.hoveredMessageIndex = len(m.messages)
 			var cmd tea.Cmd
 			m.textInput, cmd = m.textInput.Update(msg)
+			m.textInputBuffer = m.textInput.Value()
 			return m, cmd
 		}
 
 	// Handle incoming peer messages
 	case Response:
-		m.hoveredMessageIndex++
+		// m.hoveredMessageIndex++
 
 		if strings.HasPrefix(msg.text, "addr:") {
 			var addr string
 			_, _ = fmt.Sscanf(msg.text, "addr:%s", &addr)
 			msg = Response{
 				time: msg.time,
-				ip:   bubblePinkAccentStyle.Render("(SYSTEM)") + " " + msg.ip,
+				ip:   bubblePinkAccentStyle.Render("(WHOAMI)") + " " + msg.ip,
 				port: msg.port,
 				text: addr,
 			}
 		}
 
 		m.mu.Lock()
-		m.peerMessages = append(m.peerMessages, Message(msg))
-		m.allMessages = append([]Message{}, append(m.peerMessages, m.userMessages...)...)
-		// Sort the combined slice by timestamp
-		sort.Slice(m.allMessages, func(i, j int) bool {
-			return m.allMessages[i].time.Before(m.allMessages[j].time)
-		})
+		m.messages = append(m.messages, Message(msg))
 		m.mu.Unlock()
 
 		return m, waitForMessages(m.sub)
@@ -330,32 +385,16 @@ func (m *Model) View() string {
 	var output string
 
 	// debug
+	output += fmt.Sprintf("%+v\n", m.whoamiServerAddrs)
 	// output += "currentMessageIndex: " + strconv.Itoa(m.hoveredMessageIndex)
 	// output += "\nhoveredMessage: " + m.hoveredMessage
 	// output += "\ncopied: " + strconv.FormatBool(m.copied)
 	// output += "\ntextInput.Value(): " + m.textInput.Value()
 	// output += fmt.Sprintf("\nrows:%d cols:%d", m.rows, m.cols)
 	// output += fmt.Sprintf("\nlast ping: %v", m.lastPingTime)
-	// output += "\n\n"
+	output += "\n\n"
 
-	var copyButton string
-	if m.copied {
-		copyButton = buttonStyle.Render("Copied!")
-	} else {
-		copyButton = buttonStyle.Render("Copy")
-	}
-
-	// print every message like [timestamp] ip:port> text
-	for i, message := range m.allMessages {
-		// output += fmt.Sprintf("%s%s%s %s:%d%s %s",
-		// 	bubblePinkAccentStyle.Render("["),
-		// 	message.time.Format("15:04:05"),
-		// 	bubblePinkAccentStyle.Render("]"),
-		// 	message.ip,
-		// 	message.port,
-		// 	bubblePinkAccentStyle.Render(">"),
-		// 	message.text,
-		// )
+	for _, message := range m.messages {
 		output += fmt.Sprintf("%s:%d %s%s%s",
 			message.ip,
 			message.port,
@@ -366,11 +405,7 @@ func (m *Model) View() string {
 		if message.delivered {
 			output += " ✓✓"
 		}
-		if i == m.hoveredMessageIndex {
-			output += fmt.Sprintf(" %s\n", copyButton)
-		} else {
-			output += "\n"
-		}
+		output += "\n"
 		output += wrap.String(fmt.Sprintf("%s %s\n\n", bubblePinkAccentStyle.Render("|"), message.text), width)
 	}
 
@@ -383,22 +418,28 @@ func main() {
 	localPort := flag.Int("lport", 0, "Local port to bind to")
 	remoteIP := flag.String("rip", "", "Remote IP address")
 	remotePort := flag.Int("rport", 0, "Remote port")
+	
+	var whoamiServers addrList
+	flag.Var(&whoamiServers, "whoami", "[Optional] Whoami server address (can be repeated)")
 
 	flag.Parse()
 
 	// Validate flags
 	if *localPort == 0 || *remoteIP == "" || *remotePort == 0 {
-		fmt.Println("Error: All flags are required")
+		fmt.Println("Error: Required flags missing")
 		fmt.Println("Usage:")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	// Validate environment variables
-	discovery_ip := os.Getenv("discovery_ip")
-	if discovery_ip == "" {
-		fmt.Println("EnvVarError: discovery_ip not set")
-		os.Exit(1)
+	var whoamiAddrs []*net.UDPAddr
+	for _, s := range whoamiServers {
+		addr, err := net.ResolveUDPAddr("udp", s)
+		if err != nil {
+			fmt.Printf("Invalid whoami server address: %v\n", err)
+			os.Exit(1)
+		}
+		whoamiAddrs = append(whoamiAddrs, addr)
 	}
 
 	localAddr := &net.UDPAddr{
@@ -438,19 +479,14 @@ func main() {
 	ti.PromptStyle = bubblePinkAccentStyle
 
 	p := tea.NewProgram(&Model{
-		done:         done,
-		localPort:    *localPort,
-		conn:         conn,
-		remoteAddr:   remoteAddr,
-		sub:          make(chan Response),
-		pingSub:      make(chan Ping),
-		peerMessages: []Message{},
-		userMessages: []Message{},
-		textInput:    ti,
-		discoveryAddr: &net.UDPAddr{
-			IP:   net.ParseIP(discovery_ip),
-			Port: 50000,
-		},
+		done:              done,
+		localPort:         *localPort,
+		conn:              conn,
+		remoteAddr:        remoteAddr,
+		sub:               make(chan Response),
+		pingSub:           make(chan Ping),
+		textInput:         ti,
+		whoamiServerAddrs: whoamiAddrs,
 	})
 
 	// start polling the console's rows and columns
@@ -460,14 +496,4 @@ func main() {
 		fmt.Printf("Uh oh, there was an error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-func clamp(value, min, max int) int {
-	if value < min {
-		return min
-	}
-	if value > max {
-		return max
-	}
-	return value
 }
